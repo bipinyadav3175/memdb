@@ -4,13 +4,12 @@
 [![Go Version](https://img.shields.io/badge/Go-1.27+-00ADD8?logo=go)](https://go.dev/)
 [![Benchmarks](https://img.shields.io/badge/Benchmarks-Run%20Locally-6E6E6E)](#benchmarking)
 
-```text
- ___  ___  ___  ___  ___ 
-|  _ \/ _ \/ _ \/ _ \/ __|
-| |_) |  __/  __/ (_) \__ \
-|____/ \___|\___|\___/|___/
-
-        m e m d b
+```text                                          
+                              ,--.,--.    
+,--,--,--. ,---. ,--,--,--. ,-|  ||  |-.  
+|        || .-. :|        |' .-. || .-. ' 
+|  |  |  |\   --.|  |  |  |\ `-' || `-' | 
+`--`--`--' `----'`--`--`--' `---'  `---'                                            
 ```
 
 A tiny, Redis-like in-memory key-value store written in Go, exposed over the Redis RESP protocol and backed by TTL-aware entries, append-only persistence, and configurable storage backends.
@@ -63,6 +62,59 @@ Available values:
 - `map`
 - `syncmap`
 - `sharded`
+
+---
+
+## Benchmarking
+
+Benchmark coverage is included in the project with a backend matrix for:
+
+- read-heavy access
+- write-heavy access
+- mixed read/write workloads
+
+### Benchmark results
+
+Fresh results from the local test run on this machine (lower is better):
+
+| Backend | Read-heavy | Write-heavy | Mixed |
+| --- | ---: | ---: | ---: |
+| map | 44.09 ns/op | 50.00 ns/op | 57.00 ns/op |
+| syncmap | 60.38 ns/op | 98.00 ns/op | 20.00 ns/op |
+| sharded | 61.54 ns/op | 37.00 ns/op | 40.00 ns/op |
+
+### Benchmark chart
+
+```text
+ns/op by workload and backend (lower is better)
+
+Read-heavy
+  map      ████████████████████████████ 44.09
+  syncmap  ██████████████████████████ 60.38
+  sharded  ██████████████████████████ 61.54
+
+Write-heavy
+  map      ████████████████████████████ 50.00
+  syncmap  ████████████████████████████████████ 98.00
+  sharded  ███████████████████████████ 37.00
+
+Mixed
+  map      ████████████████████████████ 57.00
+  syncmap  ███████████████████████████ 20.00
+  sharded  ███████████████████████████ 40.00
+```
+
+### Run the benchmark locally
+
+```bash
+go test -run '^$' -bench 'BenchmarkStoreBackends' -benchmem
+```
+
+### Practical guidance
+
+- `map` is generally fastest for read-heavy workloads
+- `sharded` shines for write-heavy access patterns
+- `syncmap` can be competitive in mixed workloads depending on contention and access patterns
 
 ---
 
@@ -119,59 +171,6 @@ TTL recovery is implemented carefully:
 - the absolute expiry timestamp is not persisted
 
 This ensures replay restores the correct remaining lifetime rather than resetting the timer on process restart.
-
----
-
-## Benchmarking
-
-Benchmark coverage is included in the project with a backend matrix for:
-
-- read-heavy access
-- write-heavy access
-- mixed read/write workloads
-
-### Benchmark results
-
-Fresh results from the local test run on this machine (lower is better):
-
-| Backend | Read-heavy | Write-heavy | Mixed |
-| --- | ---: | ---: | ---: |
-| map | 44.09 ns/op | 50.00 ns/op | 57.00 ns/op |
-| syncmap | 60.38 ns/op | 98.00 ns/op | 20.00 ns/op |
-| sharded | 61.54 ns/op | 37.00 ns/op | 40.00 ns/op |
-
-### Benchmark chart
-
-```text
-ns/op by workload and backend (lower is better)
-
-Read-heavy
-  map      ████████████████████████████ 44.09
-  syncmap  ██████████████████████████ 60.38
-  sharded  ██████████████████████████ 61.54
-
-Write-heavy
-  map      ████████████████████████████ 50.00
-  syncmap  ████████████████████████████████████ 98.00
-  sharded  ███████████████████████████ 37.00
-
-Mixed
-  map      ████████████████████████████ 57.00
-  syncmap  ███████████████████████████ 20.00
-  sharded  ███████████████████████████ 40.00
-```
-
-### Run the benchmark locally
-
-```bash
-go test -run '^$' -bench 'BenchmarkStoreBackends' -benchmem
-```
-
-### Practical guidance
-
-- `map` is generally fastest for read-heavy workloads
-- `sharded` shines for write-heavy access patterns
-- `syncmap` can be competitive in mixed workloads depending on contention and access patterns
 
 ---
 
