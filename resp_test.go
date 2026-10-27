@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -75,5 +77,52 @@ func TestHandleRESPCommandSetWithTTL(t *testing.T) {
 	time.Sleep(1200 * time.Millisecond)
 	if got, want := handleRESPCommand([]string{"GET", "hello"}), "$-1\r\n"; got != want {
 		t.Fatalf("expired GET response = %q, want %q", got, want)
+	}
+}
+
+func TestStoreReplaysTTLFromOriginalSetTime(t *testing.T) {
+	store = NewStoreWithPath(filepath.Join(t.TempDir(), "memory-db.aof"))
+
+	rec := persistedRecord{
+		Op:    "SET",
+		Key:   "temp",
+		Value: "value",
+		TTLMS: 1000,
+		SetAt: time.Now().Add(-600 * time.Millisecond).UnixNano(),
+	}
+	store.applyRecord(rec)
+
+	value, ok := store.Get("temp")
+	if !ok || value != "value" {
+		t.Fatalf("Get temp = %q, %t, want %q, true", value, ok, "value")
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	if value, ok := store.Get("temp"); ok || value != "" {
+		t.Fatalf("expected key to expire after original TTL budget, got value=%q ok=%t", value, ok)
+	}
+}
+
+func TestStorePersistsAndReplays(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memory-db.aof")
+
+	store = NewStoreWithPath(path)
+	store.Set("hello", "world")
+	store.SetWithTTL("temp", "value", 1500*time.Millisecond)
+
+	reloaded := NewStoreWithPath(path)
+	value, ok := reloaded.Get("hello")
+	if !ok || value != "world" {
+		t.Fatalf("reloaded GET hello = %q, %t, want %q, true", value, ok, "world")
+	}
+
+	value, ok = reloaded.Get("temp")
+	if !ok || value != "value" {
+		t.Fatalf("reloaded GET temp = %q, %t, want %q, true", value, ok, "value")
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove aof path: %v", err)
 	}
 }
