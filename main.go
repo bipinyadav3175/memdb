@@ -2,12 +2,31 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"net"
+	"os"
 )
 
 func main() {
+	storeFlag := flag.String("store", "", "backend to use: map, syncmap, or sharded")
+	flag.Parse()
+
+	if *storeFlag != "" {
+		kind, err := ParseStoreKind(*storeFlag)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		if err := os.Setenv("MEMORY_DB_STORE", string(kind)); err != nil {
+			fmt.Println("Unable to set store backend env", "err:", err)
+			return
+		}
+	}
+
+	store = NewStore()
+
 	listener, err := net.Listen("tcp", ":5555")
 	if err != nil {
 		fmt.Println("Unable to start listener", "err:", err)

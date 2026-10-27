@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,13 +25,29 @@ type persistedRecord struct {
 	SetAt int64  `json:"set_at_unix_nano,omitempty"`
 }
 
+type storeKind string
+
+const (
+	storeKindMap     storeKind = "map"
+	storeKindSyncMap storeKind = "syncmap"
+	storeKindSharded storeKind = "sharded"
+)
+
+type shardedMap struct {
+	mu sync.RWMutex
+	kv map[string]entry
+}
+
 type Store struct {
 	mu      sync.RWMutex
 	kv      map[string]entry
+	syncMap *sync.Map
+	shards  []*shardedMap
 	aofPath string
+	kind    storeKind
 }
 
-var store = NewStore()
+var store *Store
 
 func defaultAOFPath() string {
 	if path := os.Getenv("MEMORY_DB_AOF_PATH"); path != "" {
@@ -38,11 +56,7 @@ func defaultAOFPath() string {
 	return "memory-db.aof"
 }
 
-func NewStore() *Store {
-	return NewStoreWithPath(defaultAOFPath())
-}
-
-func NewStoreWithPath(path string) *Store {
+func newStoreWithKind(kind storeKind, path string) *Store {
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			panic(err)
@@ -50,12 +64,147 @@ func NewStoreWithPath(path string) *Store {
 	}
 
 	s := &Store{
-		kv:      make(map[string]entry),
 		aofPath: path,
+		kind:    kind,
 	}
+
+	switch kind {
+	case storeKindSyncMap:
+		s.syncMap = &sync.Map{}
+	case storeKindSharded:
+		s.shards = make([]*shardedMap, 32)
+		for i := range s.shards {
+			s.shards[i] = &shardedMap{kv: make(map[string]entry)}
+		}
+	default:
+		s.kv = make(map[string]entry)
+	}
+
 	s.loadFromFile()
 	go s.cleanupLoop()
 	return s
+}
+
+func defaultStoreKind() storeKind {
+	kind := strings.TrimSpace(strings.ToLower(os.Getenv("MEMORY_DB_STORE")))
+	if kind == "" {
+		return storeKindMap
+	}
+
+	switch kind {
+	case "syncmap", "sync_map", "sync-map":
+		return storeKindSyncMap
+	case "sharded", "shard":
+		return storeKindSharded
+	case "map":
+		return storeKindMap
+	default:
+		return storeKindMap
+	}
+}
+
+func ParseStoreKind(raw string) (storeKind, error) {
+	s := strings.TrimSpace(strings.ToLower(raw))
+	switch s {
+	case "", "map":
+		return storeKindMap, nil
+	case "syncmap", "sync_map", "sync-map":
+		return storeKindSyncMap, nil
+	case "sharded", "shard":
+		return storeKindSharded, nil
+	default:
+		return "", fmt.Errorf("unsupported store kind %q (choose map, syncmap or sharded)", raw)
+	}
+}
+
+func NewStore() *Store {
+	return newStoreWithKind(defaultStoreKind(), defaultAOFPath())
+}
+
+func NewStoreWithPath(path string) *Store {
+	return newStoreWithKind(defaultStoreKind(), path)
+}
+
+func (s *Store) kindFor() storeKind {
+	if s == nil || s.kind == "" {
+		return storeKindMap
+	}
+	return s.kind
+}
+
+func (s *Store) shardFor(key string) *shardedMap {
+	if len(s.shards) == 0 {
+		return nil
+	}
+	index := 0
+	for _, ch := range key {
+		index = (index + int(ch)) % len(s.shards)
+	}
+	return s.shards[index]
+}
+
+func (s *Store) getEntry(key string) (entry, bool) {
+	switch s.kindFor() {
+	case storeKindSyncMap:
+		value, ok := s.syncMap.Load(key)
+		if !ok {
+			return entry{}, false
+		}
+		item, ok := value.(entry)
+		return item, ok
+	case storeKindSharded:
+		shard := s.shardFor(key)
+		if shard == nil {
+			return entry{}, false
+		}
+		shard.mu.RLock()
+		defer shard.mu.RUnlock()
+		item, ok := shard.kv[key]
+		return item, ok
+	default:
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		item, ok := s.kv[key]
+		return item, ok
+	}
+}
+
+func (s *Store) setEntry(key string, item entry) {
+	switch s.kindFor() {
+	case storeKindSyncMap:
+		s.syncMap.Store(key, item)
+	case storeKindSharded:
+		shard := s.shardFor(key)
+		if shard == nil {
+			return
+		}
+		shard.mu.Lock()
+		shard.kv[key] = item
+		shard.mu.Unlock()
+	default:
+		s.mu.Lock()
+		s.kv[key] = item
+		s.mu.Unlock()
+	}
+}
+
+func (s *Store) deleteEntry(key string) {
+	switch s.kindFor() {
+	case storeKindSyncMap:
+		s.syncMap.Delete(key)
+	case storeKindSharded:
+		shard := s.shardFor(key)
+		if shard == nil {
+			return
+		}
+		shard.mu.Lock()
+		delete(shard.kv, key)
+		shard.mu.Unlock()
+	default:
+		s.mu.Lock()
+		delete(s.kv, key)
+		s.mu.Unlock()
+	}
 }
 
 func (s *Store) cleanupLoop() {
@@ -64,13 +213,37 @@ func (s *Store) cleanupLoop() {
 
 	for range ticker.C {
 		now := time.Now()
-		s.mu.Lock()
-		for key, item := range s.kv {
-			if !item.expiresAt.IsZero() && now.After(item.expiresAt) {
-				delete(s.kv, key)
+		switch s.kindFor() {
+		case storeKindSyncMap:
+			s.syncMap.Range(func(key, value any) bool {
+				item, ok := value.(entry)
+				if !ok {
+					return true
+				}
+				if !item.expiresAt.IsZero() && now.After(item.expiresAt) {
+					s.syncMap.Delete(key)
+				}
+				return true
+			})
+		case storeKindSharded:
+			for _, shard := range s.shards {
+				shard.mu.Lock()
+				for key, item := range shard.kv {
+					if !item.expiresAt.IsZero() && now.After(item.expiresAt) {
+						delete(shard.kv, key)
+					}
+				}
+				shard.mu.Unlock()
 			}
+		default:
+			s.mu.Lock()
+			for key, item := range s.kv {
+				if !item.expiresAt.IsZero() && now.After(item.expiresAt) {
+					delete(s.kv, key)
+				}
+			}
+			s.mu.Unlock()
 		}
-		s.mu.Unlock()
 	}
 }
 
@@ -107,12 +280,9 @@ func (s *Store) loadFromFile() {
 }
 
 func (s *Store) applyRecord(rec persistedRecord) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	switch rec.Op {
 	case "DEL":
-		delete(s.kv, rec.Key)
+		s.deleteEntry(rec.Key)
 	case "SET", "":
 		item := entry{value: rec.Value}
 		if rec.TTLMS > 0 {
@@ -127,7 +297,7 @@ func (s *Store) applyRecord(rec persistedRecord) {
 				item.expiresAt = time.Now().Add(time.Duration(rec.TTLMS) * time.Millisecond)
 			}
 		}
-		s.kv[rec.Key] = item
+		s.setEntry(rec.Key, item)
 	}
 }
 
@@ -156,15 +326,12 @@ func (s *Store) persistRecord(op, key, value string, ttl time.Duration, setAt ti
 }
 
 func (s *Store) Get(key string) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	item, ok := s.kv[key]
+	item, ok := s.getEntry(key)
 	if !ok {
 		return "", false
 	}
 	if !item.expiresAt.IsZero() && time.Now().After(item.expiresAt) {
-		delete(s.kv, key)
+		s.deleteEntry(key)
 		return "", false
 	}
 
@@ -176,28 +343,22 @@ func (s *Store) Set(key string, val string) {
 }
 
 func (s *Store) SetWithTTL(key string, val string, ttl time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	now := time.Now()
 	item := entry{value: val, setAt: now}
 	if ttl > 0 {
 		item.expiresAt = now.Add(ttl)
 	}
-	s.kv[key] = item
+	s.setEntry(key, item)
 	s.persistRecord("SET", key, val, ttl, now)
 }
 
 func (s *Store) Expire(key string, ttl time.Duration) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	item, ok := s.kv[key]
+	item, ok := s.getEntry(key)
 	if !ok {
 		return false
 	}
 	if ttl <= 0 {
-		delete(s.kv, key)
+		s.deleteEntry(key)
 		s.persistRecord("DEL", key, "", 0, time.Time{})
 		return true
 	}
@@ -205,16 +366,13 @@ func (s *Store) Expire(key string, ttl time.Duration) bool {
 	now := time.Now()
 	item.expiresAt = now.Add(ttl)
 	item.setAt = now
-	s.kv[key] = item
+	s.setEntry(key, item)
 	s.persistRecord("SET", key, item.value, ttl, now)
 	return true
 }
 
 func (s *Store) TTL(key string) int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	item, ok := s.kv[key]
+	item, ok := s.getEntry(key)
 	if !ok {
 		return -2
 	}
@@ -224,29 +382,36 @@ func (s *Store) TTL(key string) int64 {
 
 	remaining := time.Until(item.expiresAt)
 	if remaining <= 0 {
-		delete(s.kv, key)
+		s.deleteEntry(key)
 		return -2
 	}
 
 	return int64(remaining / time.Second)
 }
 
+func ensureStore() *Store {
+	if store == nil {
+		store = NewStore()
+	}
+	return store
+}
+
 func Get(key string) (string, bool) {
-	return store.Get(key)
+	return ensureStore().Get(key)
 }
 
 func Set(key string, val string) {
-	store.Set(key, val)
+	ensureStore().Set(key, val)
 }
 
 func SetWithTTL(key string, val string, ttl time.Duration) {
-	store.SetWithTTL(key, val, ttl)
+	ensureStore().SetWithTTL(key, val, ttl)
 }
 
 func Expire(key string, ttl time.Duration) bool {
-	return store.Expire(key, ttl)
+	return ensureStore().Expire(key, ttl)
 }
 
 func TTL(key string) int64 {
-	return store.TTL(key)
+	return ensureStore().TTL(key)
 }
